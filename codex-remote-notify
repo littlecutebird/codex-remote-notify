@@ -1,0 +1,250 @@
+#!/usr/bin/python3
+"""Mirror remote Codex turn completions to macOS notifications."""
+
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+from pathlib import Path
+import json
+import shlex
+import sqlite3
+import subprocess
+import sys
+import time
+
+
+HOME = Path.home()
+CATALOG = HOME / ".codex/sqlite/codex-dev.db"
+STATE = HOME / ".codex/codex-remote-notify.last"
+SOUND = Path("/Applications/ChatGPT.app/Contents/Resources/codex-notification.wav")
+HOST_PREFIX = "remote-ssh-discovered:"
+POLL_SECONDS = 3
+
+REMOTE_SCAN = r'''
+import glob, json, os, re, time
+
+root = os.path.expanduser("~/.codex")
+events = []
+for path in glob.glob(f"{root}/sessions/**/*.jsonl", recursive=True):
+    if os.path.getmtime(path) < time.time() - 600:
+        continue
+    match = re.search(r"([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})\.jsonl$", path)
+    if not match:
+        continue
+    message = ""
+    with open(path, "rb") as rollout:
+        rollout.seek(0, 2)
+        size = rollout.tell()
+        # ponytail: the last 1 MiB covers a completion tail; index if that stops being true.
+        rollout.seek(max(0, size - 1024 * 1024))
+        if size > 1024 * 1024:
+            rollout.readline()
+        for raw in rollout:
+            try:
+                event = json.loads(raw)
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            if event.get("type") != "event_msg":
+                continue
+            payload = event.get("payload", {})
+            if payload.get("type") == "agent_message" and payload.get("phase") == "final_answer":
+                message = payload.get("message", "")
+            elif payload.get("type") == "task_complete":
+                events.append({
+                    "thread_id": match.group(1),
+                    "turn_id": payload.get("turn_id", ""),
+                    "message": message,
+                    "completed_at": event.get("timestamp", ""),
+                })
+print(json.dumps(events, ensure_ascii=False))
+'''
+
+
+def catalog_rows(query, parameters=()):
+    database = sqlite3.connect(f"file:{CATALOG}?mode=ro", uri=True, timeout=2)
+    try:
+        return database.execute(query, parameters).fetchall()
+    finally:
+        database.close()
+
+
+def discover_hosts():
+    rows = catalog_rows(
+        "select distinct host_id from local_thread_catalog "
+        "where host_id like ? and missing_candidate = 0 order by host_id",
+        (HOST_PREFIX + "%",),
+    )
+    return [(host_id, host_id[len(HOST_PREFIX) :]) for (host_id,) in rows]
+
+
+def poll(host_id, host):
+    command = f"python3 -c {shlex.quote(REMOTE_SCAN)}"
+    result = subprocess.run(
+        [
+            "/usr/bin/ssh",
+            "-o", "BatchMode=yes",
+            "-o", "ConnectTimeout=5",
+            "-o", "ConnectionAttempts=1",
+            host,
+            command,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=12,
+    )
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or "remote scan failed")
+    events = json.loads(result.stdout)
+    for event in events:
+        event.update(host_id=host_id, host=host)
+    return events
+
+
+def poll_all(hosts):
+    results, errors = {}, {}
+    if not hosts:
+        return results, errors
+    with ThreadPoolExecutor(max_workers=min(8, len(hosts))) as pool:
+        futures = {pool.submit(poll, host_id, host): (host_id, host) for host_id, host in hosts}
+        for future in as_completed(futures):
+            host_id, host = futures[future]
+            try:
+                results[host_id] = future.result()
+            except Exception as error:
+                errors[host] = str(error)
+    return results, errors
+
+
+def title_for(event):
+    rows = catalog_rows(
+        "select display_title from local_thread_catalog "
+        "where host_id = ? and thread_id = ? and missing_candidate = 0 limit 1",
+        (event["host_id"], event["thread_id"]),
+    )
+    return rows[0][0] if rows else f"Codex on {event['host']}"
+
+
+def excerpt_for(message):
+    excerpt = " ".join(message.split())
+    return excerpt if len(excerpt) <= 180 else excerpt[:177] + "..."
+
+
+def notify(title, message, host):
+    excerpt = excerpt_for(message) or f"Turn completed on {host}"
+    script = (
+        "on run argv\n"
+        "display notification (item 2 of argv) with title (item 1 of argv)\n"
+        "end run"
+    )
+    subprocess.run(
+        ["/usr/bin/osascript", "-e", script, title, excerpt],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(["/usr/bin/afplay", str(SOUND)], check=True, capture_output=True)
+    return excerpt
+
+
+def completed_after(event, started_at):
+    value = event.get("completed_at", "")
+    if not value:
+        return False
+    return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp() >= started_at
+
+
+def save(event, title, excerpt):
+    STATE.write_text(
+        json.dumps(
+            {
+                **event,
+                "display_title": title,
+                "excerpt": excerpt,
+                "sound": SOUND.name,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+
+def run():
+    started_at = time.time()
+    seen = {}
+    while True:
+        try:
+            hosts = discover_hosts()
+            results, errors = poll_all(hosts)
+            for host, error in errors.items():
+                print(f"codex-remote-notify: {host}: {error}", file=sys.stderr, flush=True)
+            for host_id, events in results.items():
+                known = seen.setdefault(host_id, set())
+                first_poll = not known
+                for event in events:
+                    turn_id = event.get("turn_id", "")
+                    if not turn_id or turn_id in known:
+                        continue
+                    if not first_poll or completed_after(event, started_at):
+                        title = title_for(event)
+                        excerpt = notify(title, event.get("message", ""), event["host"])
+                        save(event, title, excerpt)
+                    known.add(turn_id)
+        except Exception as error:
+            print(f"codex-remote-notify: {error}", file=sys.stderr, flush=True)
+        time.sleep(POLL_SECONDS)
+
+
+def check(host_names):
+    if not CATALOG.is_file():
+        raise RuntimeError(f"Codex catalog not found: {CATALOG}")
+    if not SOUND.is_file():
+        raise RuntimeError(f"Codex notification sound not found: {SOUND}")
+    hosts = (
+        [(HOST_PREFIX + host, host) for host in host_names]
+        if host_names
+        else discover_hosts()
+    )
+    print(f"catalog: {CATALOG}")
+    print(f"sound: {SOUND}")
+    if not hosts:
+        print("hosts: none discovered")
+        return 1
+    results, errors = poll_all(hosts)
+    for host_id, host in hosts:
+        if host in errors:
+            print(f"{host}: ERROR {errors[host]}")
+        else:
+            print(f"{host}: OK ({len(results[host_id])} recent completions)")
+    return bool(errors)
+
+
+def self_test():
+    assert excerpt_for("  hello\n remote   world  ") == "hello remote world"
+    assert excerpt_for("x" * 181) == "x" * 177 + "..."
+    assert completed_after({"completed_at": "2026-01-01T00:00:01Z"}, 1767225600)
+    assert not completed_after({"completed_at": ""}, 0)
+    print("self-test: OK")
+
+
+def main():
+    arguments = sys.argv[1:]
+    if arguments[:1] == ["--self-test"]:
+        self_test()
+        return 0
+    if arguments[:1] == ["--test"]:
+        notify("Remote notification test", "This is the completed response preview.", "test")
+        return 0
+    if arguments[:1] == ["--check"]:
+        return check(arguments[1:])
+    if arguments == ["--list-hosts"]:
+        for _, host in discover_hosts():
+            print(host)
+        return 0
+    if arguments:
+        print("usage: codex-remote-notify [--check [HOST ...] | --list-hosts | --test | --self-test]", file=sys.stderr)
+        return 2
+    run()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
