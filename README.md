@@ -10,6 +10,7 @@ installed on the remote nodes.
 ## Requirements
 
 - macOS with the ChatGPT desktop app in `/Applications`
+- Xcode Command Line Tools (for `swiftc`)
 - Passwordless SSH aliases (`BatchMode=yes`) for the remote nodes
 - Python 3 on the Mac and remote nodes
 - At least one Codex desktop task opened on each remote node

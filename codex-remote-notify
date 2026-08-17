@@ -16,6 +16,7 @@ HOME = Path.home()
 CATALOG = HOME / ".codex/sqlite/codex-dev.db"
 STATE = HOME / ".codex/codex-remote-notify.last"
 SOUND = Path("/Applications/ChatGPT.app/Contents/Resources/codex-notification.wav")
+NOTIFIER = HOME / ".local/lib/codex-remote-notifier.app/Contents/MacOS/notifier"
 HOST_PREFIX = "remote-ssh-discovered:"
 POLL_SECONDS = 3
 
@@ -130,13 +131,8 @@ def excerpt_for(message):
 
 def notify(title, message, host):
     excerpt = excerpt_for(message) or f"Turn completed on {host}"
-    script = (
-        "on run argv\n"
-        "display notification (item 2 of argv) with title (item 1 of argv)\n"
-        "end run"
-    )
     subprocess.run(
-        ["/usr/bin/osascript", "-e", script, title, excerpt],
+        [str(NOTIFIER), title, excerpt],
         check=True,
         capture_output=True,
         text=True,
@@ -198,6 +194,8 @@ def check(host_names):
         raise RuntimeError(f"Codex catalog not found: {CATALOG}")
     if not SOUND.is_file():
         raise RuntimeError(f"Codex notification sound not found: {SOUND}")
+    if not NOTIFIER.is_file():
+        raise RuntimeError(f"Codex notification helper not found: {NOTIFIER}")
     hosts = (
         [(HOST_PREFIX + host, host) for host in host_names]
         if host_names
